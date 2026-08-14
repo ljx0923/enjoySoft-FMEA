@@ -1,0 +1,179 @@
+   /**
+     * 检索结果按关系网建立顺序排序（从左到右、从上而下）
+     * 关系网分两部分：左边结构树为结构（node_type in (5,8)），
+     * 右边为结构下的功能、特性、失效、措施状态、措施（node_type in (12,13,14,18,19,20,21,23,24)）。
+     * 先按左树结构的node_path定位结构顺序，同一结构下的命中数据再按右网顺序排列。
+     * 批量查询后用Map建索引再一次性排序，时间复杂度O(nlogn)，避免O(n²)
+     */
+    private void sortByStructureNetOrder(List<StructureTreeSearchVo> searchVos, Long projectId) {
+        if (CollectionUtils.isEmpty(searchVos) || projectId == null) {
+            return;
+        }
+        List<Long> structureIds = searchVos.stream().map(StructureTreeSearchVo::getStructureId)
+                .filter(Objects::nonNull).distinct().collect(Collectors.toList());
+        if (CollectionUtils.isEmpty(structureIds)) {
+            return;
+        }
+        // 左树：批量查询命中结构对应的结构树节点（结构节点node_type：5,8）
+        Integer[] leftNodeTypes = new Integer[]{5, 8};
+        List<TvStructureTree> structureTreeNodes = new ArrayList<>();
+        for (int fromIndex = 0; fromIndex < structureIds.size(); fromIndex += DELETE_TREE_SQL_BATCH_SIZE) {
+            List<Long> batchIds = structureIds.subList(fromIndex, Math.min(fromIndex + DELETE_TREE_SQL_BATCH_SIZE, structureIds.size()));
+            structureTreeNodes.addAll(tvStructureTreeMapper.selectTvStructureTreeByProjectExtraId(
+                    batchIds.toArray(new Long[0]), projectId, leftNodeTypes));
+        }
+        // structureId -> node_path解析出的逐级ID数组（左树位置）；一个结构对应多个树节点时保留层级最浅的一个
+        Map<Long, long[]> structurePathKeyMap = new HashMap<>(structureTreeNodes.size());
+        for (TvStructureTree treeNode : structureTreeNodes) {
+            long[] pathKey = parseNodePathKey(treeNode.getNodePath());
+            if (pathKey == null || treeNode.getExtraId() == null) {
+                continue;
+            }
+            structurePathKeyMap.merge(treeNode.getExtraId(), pathKey,
+                    (oldKey, newKey) -> comparePathKey(oldKey, newKey) <= 0 ? oldKey : newKey);
+        }
+        // 右网：批量查询命中结构下的功能、特性、失效、措施状态、措施节点
+        Integer[] rightNodeTypes = new Integer[]{12, 13, 14, 18, 19, 20, 21, 23, 24};
+        List<TvStructureTree> rightNetNodes = new ArrayList<>();
+        for (int fromIndex = 0; fromIndex < structureIds.size(); fromIndex += DELETE_TREE_SQL_BATCH_SIZE) {
+            List<Long> batchIds = structureIds.subList(fromIndex, Math.min(fromIndex + DELETE_TREE_SQL_BATCH_SIZE, structureIds.size()));
+            rightNetNodes.addAll(tvStructureTreeMapper.selectRightNetNodesByStructureIds(projectId, batchIds, rightNodeTypes));
+        }
+        // structureId -> (extraId -> 右网深度优先序号)：先按结构下的功能/特性排序，每个节点的下级子树紧跟其后依次排列
+        Map<Long, Map<Long, long[]>> rightNetKeyMap = buildRightNetKeyMap(rightNetNodes);
+        // 第一步：按左树结构的node_path顺序定位结构（从左到右、从上而下）；未挂在结构树上的排在最后
+        searchVos.sort(Comparator
+                .comparing((StructureTreeSearchVo vo) -> structurePathKeyMap.get(vo.getStructureId()),
+                        Comparator.nullsLast(this::comparePathKey))
+                .thenComparing(vo -> vo.getStructureId() == null ? Long.MAX_VALUE : vo.getStructureId()));
+        // 第二步：同一结构下的命中数据按右网顺序排列（从左到右、从上而下）
+        for (StructureTreeSearchVo searchVo : searchVos) {
+            List<Long> extraIds = searchVo.getExtraId();
+            if (CollectionUtils.isEmpty(extraIds) || extraIds.size() <= 1) {
+                continue;
+            }
+            Map<Long, long[]> nodeKeyMap = rightNetKeyMap.getOrDefault(searchVo.getStructureId(), Collections.emptyMap());
+            Long structureId = searchVo.getStructureId();
+            Comparator<Long> extraIdComparator = Comparator.comparing(
+                    (Long extraId) -> buildExtraSortKey(extraId, structureId, nodeKeyMap),
+                    Comparator.nullsLast(this::comparePathKey));
+            extraIds.sort(Comparator.nullsLast(extraIdComparator));
+        }
+    }
+
+    /**
+     * 构造命中数据的右网排序键：结构本身排最前，右网节点按深度优先序号，未命中的返回null排最后
+     */
+    private long[] buildExtraSortKey(Long extraId, Long structureId, Map<Long, long[]> nodeKeyMap) {
+        if (extraId == null) {
+            return null;
+        }
+        // 命中的是结构本身，排在结构下数据之前
+        if (structureId != null && extraId.equals(structureId)) {
+            return new long[]{Long.MIN_VALUE};
+        }
+        return nodeKeyMap.get(extraId);
+    }
+
+    /**
+     * 按右网节点的父子关系构建每个结构下的深度优先顺序：
+     * 先按结构下的功能/特性排序，每个功能/特性下的子树（特性、失效、措施状态、措施）紧跟其后依次排列，
+     * 而不是按层级把所有同层节点排完再排下一层
+     */
+    private Map<Long, Map<Long, long[]>> buildRightNetKeyMap(List<TvStructureTree> rightNetNodes) {
+        Map<Long, Map<Long, long[]>> rightNetKeyMap = new HashMap<>();
+        if (CollectionUtils.isEmpty(rightNetNodes)) {
+            return rightNetKeyMap;
+        }
+        // 按所属结构分组
+        Map<Long, List<TvStructureTree>> structureNodeMap = rightNetNodes.stream()
+                .filter(node -> node.getExtraStructureId() != null && node.getId() != null)
+                .collect(Collectors.groupingBy(TvStructureTree::getExtraStructureId));
+        // 同级节点的先后顺序：node_type、node_order、id
+        Comparator<TvStructureTree> netOrderComparator = Comparator
+                .comparing((TvStructureTree node) -> node.getNodeType() == null ? Integer.MAX_VALUE : node.getNodeType())
+                .thenComparing(node -> node.getNodeOrder() == null ? Integer.MAX_VALUE : node.getNodeOrder())
+                .thenComparing(node -> node.getId() == null ? Long.MAX_VALUE : node.getId());
+        for (Map.Entry<Long, List<TvStructureTree>> entry : structureNodeMap.entrySet()) {
+            List<TvStructureTree> nodes = entry.getValue();
+            Set<Long> nodeIds = nodes.stream().map(TvStructureTree::getId).collect(Collectors.toSet());
+            // 父节点不在右网节点内的即为直接挂在结构下的根节点；parentId -> 子节点列表
+            Map<Long, List<TvStructureTree>> childrenMap = new HashMap<>();
+            List<TvStructureTree> roots = new ArrayList<>();
+            for (TvStructureTree node : nodes) {
+                if (node.getParentId() == null || !nodeIds.contains(node.getParentId())) {
+                    roots.add(node);
+                } else {
+                    childrenMap.computeIfAbsent(node.getParentId(), k -> new ArrayList<>()).add(node);
+                }
+            }
+            roots.sort(netOrderComparator);
+            childrenMap.values().forEach(children -> children.sort(netOrderComparator));
+            // 深度优先遍历生成序号，序号即排序键；同一业务节点出现多次时保留靠前的序号
+            long[] order = {0};
+            Map<Long, long[]> extraIdOrderMap = new HashMap<>();
+            Deque<TvStructureTree> stack = new ArrayDeque<>();
+            for (int i = roots.size() - 1; i >= 0; i--) {
+                stack.push(roots.get(i));
+            }
+            while (!stack.isEmpty()) {
+                TvStructureTree node = stack.pop();
+                if (node.getExtraId() != null) {
+                    extraIdOrderMap.putIfAbsent(node.getExtraId(), new long[]{order[0]++});
+                }
+                List<TvStructureTree> children = childrenMap.get(node.getId());
+                if (children != null) {
+                    for (int i = children.size() - 1; i >= 0; i--) {
+                        stack.push(children.get(i));
+                    }
+                }
+            }
+            rightNetKeyMap.put(entry.getKey(), extraIdOrderMap);
+        }
+        return rightNetKeyMap;
+    }
+
+    /**
+     * 将node_path（如/1/2/3/）解析为逐级ID数组，作为结构网顺序的排序键
+     */
+    private long[] parseNodePathKey(String nodePath) {
+        if (StringUtils.isEmpty(nodePath)) {
+            return null;
+        }
+        try {
+            String[] segments = nodePath.split("/");
+            List<Long> keys = new ArrayList<>(segments.length);
+            for (String segment : segments) {
+                if (StringUtils.isNotEmpty(segment)) {
+                    keys.add(Long.parseLong(segment));
+                }
+            }
+            if (keys.isEmpty()) {
+                return null;
+            }
+            long[] pathKey = new long[keys.size()];
+            for (int i = 0; i < keys.size(); i++) {
+                pathKey[i] = keys.get(i);
+            }
+            return pathKey;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 逐级比较两个路径ID数组，前缀相同时层级浅的排在前面
+     */
+    private int comparePathKey(long[] leftKey, long[] rightKey) {
+        int minLength = Math.min(leftKey.length, rightKey.length);
+        for (int i = 0; i < minLength; i++) {
+            if (leftKey[i] != rightKey[i]) {
+                return Long.compare(leftKey[i], rightKey[i]);
+            }
+        }
+        return Integer.compare(leftKey.length, rightKey.length);
+    }
+
+
+
+        select extra_structure_id, extra_id, node_type, node_deep, node_order, parent_id, id
