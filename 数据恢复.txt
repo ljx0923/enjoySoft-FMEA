@@ -1,0 +1,544 @@
+-- =====================================================================
+-- 数据恢复脚本（按结构ID定位剪切子树版本）
+-- 场景：结构树某节点剪切粘贴失败，删除接口已执行，源数据被逻辑删除、
+--       tv_structure_tree 树节点被物理删除。
+-- 数据库：PostgreSQL
+--
+-- 恢复策略：
+--   1) 以【被剪切顶层结构的ID】为根，递归 tt_structure 找出全部子结构
+--      （del_flag='1' 的即为被误删数据）；
+--   2) 按这批结构ID关联恢复：功能/特性表、失效表、措施表、风险状态表
+--      （均以 structure_id 圈定，全部逻辑删除，改回 '0'）；
+--   3) 清理脏数据：子树范围内“业务行不存在/仍被逻辑删除”的树节点、
+--      以及“父节点id已不存在”的树节点，全部物理删除；
+--   4) 重建 tv_structure_tree：结构→父结构、功能/特性→所属结构（功能下也可挂特性）、
+--      失效→功能/特性（功能和特性都可建失效）、措施状态→失效、措施→措施状态，
+--      即层级：功能/特性 → 失效 → 措施状态 → 措施，逐层循环挂接；
+--      【父节点找不到的记录一律不插入】，最后单独列出来供人工处理；
+--   5) 功能网/失效网关系表（tr_function_relation / tr_failure_relation）、
+--      接口（tt_structure_interface）为物理删除，SQL 无法找回。
+--
+-- 使用步骤：
+--   第 0 步：修改下方 tmp_root 中的结构ID，先执行“核对范围”SELECT；
+--   第 1 步：执行备份语句；
+--   第 2 步：执行 BEGIN ... COMMIT 事务，看末尾校验结果，
+--           异常则把最后的 COMMIT 改为 ROLLBACK 后重跑。
+-- =====================================================================
+
+
+-- ===================== 第 0 步：指定根结构ID并核对范围 =====================
+-- ★★★ 把 0 改成被剪切的顶层结构节点ID（tt_structure.id）★★★
+DROP TABLE IF EXISTS tmp_root;
+CREATE TEMP TABLE tmp_root AS SELECT 0::bigint AS root_id;
+
+-- 0.1 确认根节点存在且确实被逻辑删除
+SELECT * FROM tt_structure WHERE id = (SELECT root_id FROM tmp_root);
+
+-- 0.2 递归列出子树内全部结构（del_flag='1' 即本次要恢复的）
+WITH RECURSIVE sub AS (
+    SELECT s.* FROM tt_structure s WHERE s.id = (SELECT root_id FROM tmp_root)
+    UNION ALL
+    SELECT s.* FROM tt_structure s JOIN sub r ON s.parent_id = r.id
+)
+SELECT id, parent_id, node_type, description, del_flag FROM sub ORDER BY parent_id, id;
+
+-- 0.3 子树关联的功能/特性、失效、措施、风险状态（预览）
+WITH RECURSIVE sub AS (
+    SELECT s.id FROM tt_structure s WHERE s.id = (SELECT root_id FROM tmp_root)
+    UNION ALL
+    SELECT s.id FROM tt_structure s JOIN sub r ON s.parent_id = r.id
+)
+SELECT 'tt_function' AS tbl, COUNT(*) FROM tt_function    WHERE structure_id IN (SELECT id FROM sub) AND del_flag = '1'
+UNION ALL
+SELECT 'tt_failure',       COUNT(*) FROM tt_failure       WHERE structure_id IN (SELECT id FROM sub) AND del_flag = '1'
+UNION ALL
+SELECT 'tt_measure',       COUNT(*) FROM tt_measure       WHERE structure_id IN (SELECT id FROM sub) AND del_flag = '1'
+UNION ALL
+SELECT 'tt_risk_status',   COUNT(*) FROM tt_risk_status   WHERE structure_id IN (SELECT id FROM sub) AND del_flag = '1';
+
+
+-- ===================== 第 1 步：备份 =====================
+CREATE TABLE IF NOT EXISTS bak_tt_structure_20260831      AS SELECT * FROM tt_structure     WHERE del_flag = '1';
+CREATE TABLE IF NOT EXISTS bak_tt_function_20260831       AS SELECT * FROM tt_function      WHERE del_flag = '1';
+CREATE TABLE IF NOT EXISTS bak_tt_failure_20260831        AS SELECT * FROM tt_failure       WHERE del_flag = '1';
+CREATE TABLE IF NOT EXISTS bak_tt_measure_20260831        AS SELECT * FROM tt_measure       WHERE del_flag = '1';
+CREATE TABLE IF NOT EXISTS bak_tt_risk_status_20260831    AS SELECT * FROM tt_risk_status   WHERE del_flag = '1';
+CREATE TABLE IF NOT EXISTS bak_tv_structure_tree_20260831 AS SELECT * FROM tv_structure_tree;
+
+
+-- ===================== 第 2 步：恢复（事务内执行） =====================
+BEGIN;
+
+-- ---------------------------------------------------------------------
+-- 2.1 圈定恢复范围：递归子结构 + 按结构ID关联其他业务表
+-- ---------------------------------------------------------------------
+CREATE TEMP TABLE tmp_restore_structure AS
+WITH RECURSIVE sub AS (
+    SELECT s.* FROM tt_structure s WHERE s.id = (SELECT root_id FROM tmp_root)
+    UNION ALL
+    SELECT s.* FROM tt_structure s JOIN sub r ON s.parent_id = r.id
+)
+SELECT * FROM sub WHERE del_flag = '1';
+
+CREATE TEMP TABLE tmp_restore_function AS
+SELECT * FROM tt_function
+WHERE del_flag = '1' AND structure_id IN (SELECT id FROM tmp_restore_structure);
+
+CREATE TEMP TABLE tmp_restore_failure AS
+SELECT * FROM tt_failure
+WHERE del_flag = '1' AND structure_id IN (SELECT id FROM tmp_restore_structure);
+
+CREATE TEMP TABLE tmp_restore_measure AS
+SELECT * FROM tt_measure
+WHERE del_flag = '1' AND structure_id IN (SELECT id FROM tmp_restore_structure);
+
+CREATE TEMP TABLE tmp_restore_risk_status AS
+SELECT * FROM tt_risk_status
+WHERE del_flag = '1' AND structure_id IN (SELECT id FROM tmp_restore_structure);
+
+-- ---------------------------------------------------------------------
+-- 2.2 恢复逻辑删除标记
+-- ---------------------------------------------------------------------
+UPDATE tt_structure   SET del_flag = '0' WHERE id IN (SELECT id FROM tmp_restore_structure);
+UPDATE tt_function    SET del_flag = '0' WHERE id IN (SELECT id FROM tmp_restore_function);
+UPDATE tt_failure     SET del_flag = '0' WHERE id IN (SELECT id FROM tmp_restore_failure);
+UPDATE tt_measure     SET del_flag = '0' WHERE id IN (SELECT id FROM tmp_restore_measure);
+UPDATE tt_risk_status SET del_flag = '0' WHERE id IN (SELECT id FROM tmp_restore_risk_status);
+
+-- ---------------------------------------------------------------------
+-- 2.3 清理脏数据（仅限本子树范围，extra_structure_id 即子树内结构）
+--     a) 树节点对应的业务行不存在或仍为逻辑删除 → 脏节点，删除
+--     b) 树节点的 parent_id 指向的行不存在 → 断链节点，删除
+-- ---------------------------------------------------------------------
+DELETE FROM tv_structure_tree t
+WHERE t.extra_structure_id IN (SELECT id FROM tmp_restore_structure)
+  AND (
+       (t.node_type IN (1,2,3,4,5,6,7,8,10,11)
+            AND NOT EXISTS (SELECT 1 FROM tt_structure   b WHERE b.id = t.extra_id AND b.del_flag = '0'))
+    OR (t.node_type IN (12,13)
+            AND NOT EXISTS (SELECT 1 FROM tt_function    b WHERE b.id = t.extra_id AND b.del_flag = '0'))
+    OR (t.node_type IN (14,15,16,17)
+            AND NOT EXISTS (SELECT 1 FROM tt_failure     b WHERE b.id = t.extra_id AND b.del_flag = '0'))
+    OR (t.node_type IN (18,19)
+            AND NOT EXISTS (SELECT 1 FROM tt_measure     b WHERE b.id = t.extra_id AND b.del_flag = '0'))
+    OR (t.node_type IN (20,21,22,26)
+            AND NOT EXISTS (SELECT 1 FROM tt_risk_status b WHERE b.id = t.extra_id AND b.del_flag = '0'))
+  );
+
+DELETE FROM tv_structure_tree t
+WHERE t.extra_structure_id IN (SELECT id FROM tmp_restore_structure)
+  AND t.parent_id IS NOT NULL AND t.parent_id <> 0
+  AND NOT EXISTS (SELECT 1 FROM tv_structure_tree p WHERE p.id = t.parent_id);
+
+-- ---------------------------------------------------------------------
+-- 2.4 重建结构节点：父树节点 = 父结构的树节点，循环逐层挂接；
+--     父节点找不到的不插入（最后统一列出来）
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+BEGIN
+    LOOP
+        WITH missing AS (
+            SELECT s.id            AS structure_id,
+                   s.project_id    AS project_id,
+                   s.node_type     AS node_type,
+                   s.knowledge_id  AS knowledge_id,
+                   s.description   AS node_name,
+                   pt.id           AS parent_tree_id
+            FROM tmp_restore_structure s
+            JOIN tt_structure p
+                 ON p.id = s.parent_id AND p.project_id = s.project_id AND p.del_flag = '0'
+            JOIN tv_structure_tree pt
+                 ON pt.project_id = s.project_id
+                AND pt.extra_id = p.id
+                AND pt.node_type = p.node_type
+            WHERE NOT EXISTS (
+                SELECT 1 FROM tv_structure_tree t
+                WHERE t.project_id = s.project_id
+                  AND t.extra_id = s.id
+                  AND t.node_type = s.node_type
+            )
+        )
+        INSERT INTO tv_structure_tree
+                (project_id, parent_id, extra_id, extra_structure_id, knowledge_id,
+                 node_name, node_type, node_deep, node_order, has_child,
+                 create_by, update_by, update_time, create_time)
+            SELECT m.project_id,
+                   m.parent_tree_id,
+                   m.structure_id,
+                   m.structure_id,
+                   m.knowledge_id,
+                   m.node_name,
+                   m.node_type,
+                   pt.node_deep + 1,
+                   COALESCE((SELECT MAX(t2.node_order) FROM tv_structure_tree t2
+                             WHERE t2.parent_id = m.parent_tree_id), 0)
+                       + ROW_NUMBER() OVER (PARTITION BY m.parent_tree_id ORDER BY m.structure_id),
+                   '1',
+                   'FMEA20260901', 'FMEA20260901', now(), now()
+            FROM missing m
+            JOIN tv_structure_tree pt ON pt.id = m.parent_tree_id;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        EXIT WHEN v_count = 0;
+    END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.5 重建功能/特性节点：父为其所属结构/上级功能的树节点
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+BEGIN
+    LOOP
+        WITH missing AS (
+            SELECT f.id           AS function_id,
+                   f.project_id   AS project_id,
+                   f.node_type    AS node_type,
+                   f.knowledge_id AS knowledge_id,
+                   f.description  AS node_name,
+                   pt.id          AS parent_tree_id,
+                   pt.extra_structure_id AS extra_structure_id
+            FROM tmp_restore_function f
+            JOIN tv_structure_tree pt
+                 ON pt.project_id = f.project_id
+                AND pt.extra_id = f.parent_id
+                AND pt.node_type = CASE
+                        WHEN f.parent_id = f.structure_id
+                            THEN (SELECT p.node_type FROM tt_structure p
+                                  WHERE p.id = f.parent_id AND p.project_id = f.project_id AND p.del_flag = '0')
+                        ELSE (SELECT g.node_type FROM tt_function g
+                              WHERE g.id = f.parent_id AND g.project_id = f.project_id AND g.del_flag = '0')
+                    END
+            WHERE NOT EXISTS (
+                SELECT 1 FROM tv_structure_tree t
+                WHERE t.project_id = f.project_id
+                  AND t.extra_id = f.id
+                  AND t.node_type = f.node_type
+            )
+        )
+        INSERT INTO tv_structure_tree
+                (project_id, parent_id, extra_id, extra_structure_id, knowledge_id,
+                 node_name, node_type, node_deep, node_order, has_child,
+                 remote_id, category,
+                 create_by, update_by, update_time, create_time)
+            SELECT m.project_id,
+                   m.parent_tree_id,
+                   m.function_id,
+                   m.extra_structure_id,
+                   m.knowledge_id,
+                   m.remote_id,
+                   m.category,
+                   m.node_name,
+                   m.node_type,
+                   pt.node_deep + 1,
+                   COALESCE((SELECT MAX(t2.node_order) FROM tv_structure_tree t2
+                             WHERE t2.parent_id = m.parent_tree_id), 0)
+                       + ROW_NUMBER() OVER (PARTITION BY m.parent_tree_id ORDER BY m.function_id),
+                   '1',
+                   'FMEA20260901', 'FMEA20260901', now(), now()
+            FROM missing m
+            JOIN tv_structure_tree pt ON pt.id = m.parent_tree_id;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        EXIT WHEN v_count = 0;
+    END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.6 重建失效节点(14-17)：父为所属功能/特性的树节点
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+BEGIN
+    LOOP
+        WITH missing AS (
+            SELECT fl.id           AS failure_id,
+                   fl.project_id   AS project_id,
+                   fl.node_type    AS node_type,
+                   fl.knowledge_id AS knowledge_id,
+                   -- 节点名与系统 getDescriptionValue 一致：[S=严重度]描述，严重度无值时用?代替
+                   '[S=' || COALESCE(fl.score_number::text, '?') || '] ' || fl.description AS node_name,
+                   pt.id           AS parent_tree_id,
+                   pt.extra_structure_id AS extra_structure_id
+            FROM tmp_restore_failure fl
+            JOIN tv_structure_tree pt
+                 ON pt.project_id = fl.project_id
+                AND pt.extra_id = fl.function_id
+                AND pt.node_type = (SELECT g.node_type FROM tt_function g
+                                    WHERE g.id = fl.function_id AND g.project_id = fl.project_id AND g.del_flag = '0')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM tv_structure_tree t
+                WHERE t.project_id = fl.project_id
+                  AND t.extra_id = fl.id
+                  AND t.node_type = fl.node_type
+            )
+        )
+        INSERT INTO tv_structure_tree
+                (project_id, parent_id, extra_id, extra_structure_id, knowledge_id,
+                 node_name, node_type, node_deep, node_order, has_child,
+                 create_by, update_by, update_time, create_time)
+            SELECT m.project_id,
+                   m.parent_tree_id,
+                   m.failure_id,
+                   m.extra_structure_id,
+                   m.knowledge_id,
+                   m.node_name,
+                   m.node_type,
+                   pt.node_deep + 1,
+                   COALESCE((SELECT MAX(t2.node_order) FROM tv_structure_tree t2
+                             WHERE t2.parent_id = m.parent_tree_id), 0)
+                       + ROW_NUMBER() OVER (PARTITION BY m.parent_tree_id ORDER BY m.failure_id),
+                   '1',
+                   'FMEA20260901', 'FMEA20260901', now(), now()
+            FROM missing m
+            JOIN tv_structure_tree pt ON pt.id = m.parent_tree_id;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        EXIT WHEN v_count = 0;
+    END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.7 重建措施状态(风险状态)节点(20/21/22/26)：父为所属失效的树节点
+--     （层级：功能/特性 → 失效 → 措施状态 → 措施）
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+BEGIN
+    LOOP
+        WITH missing AS (
+            SELECT rs.id           AS risk_status_id,
+                   rs.project_id   AS project_id,
+                   rs.node_type    AS node_type,
+                   rs.knowledge_id AS knowledge_id,
+                   -- 节点名与系统 TtRiskStatus.getDescriptionValue 一致：
+                   -- 初始/优化状态(20/21)拼 ' O=? D=? RPN=? AP=?'，诊断响应状态(22/26)拼 ' M=? F=?'，无值用?代替
+                   COALESCE(rs.description, '') || CASE
+                       WHEN rs.node_type IN (20, 21)
+                           THEN ' O=' || COALESCE(rs.o::text, '?')
+                                || ' D=' || COALESCE(rs.d::text, '?')
+                                || ' RPN=' || COALESCE(rs.rpn::text, '?')
+                                || ' AP=' || COALESCE(rs.ap::text, '?')
+                       WHEN rs.node_type IN (22, 26)
+                           THEN ' M=' || COALESCE(rs.m::text, '?')
+                                || ' F=' || COALESCE(rs.f::text, '?')
+                       ELSE ''
+                   END AS node_name,
+                   pt.id           AS parent_tree_id,
+                   pt.extra_structure_id AS extra_structure_id
+            FROM tmp_restore_risk_status rs
+            JOIN tv_structure_tree pt
+                 ON pt.project_id = rs.project_id
+                AND pt.extra_id = rs.failure_id
+                AND pt.node_type = (SELECT fl.node_type FROM tt_failure fl
+                                    WHERE fl.id = rs.failure_id AND fl.project_id = rs.project_id AND fl.del_flag = '0')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM tv_structure_tree t
+                WHERE t.project_id = rs.project_id
+                  AND t.extra_id = rs.id
+                  AND t.node_type = rs.node_type
+            )
+        )
+        INSERT INTO tv_structure_tree
+                (project_id, parent_id, extra_id, extra_structure_id, knowledge_id,
+                 node_name, node_type, node_deep, node_order, has_child,
+                 create_by, update_by, update_time, create_time)
+            SELECT m.project_id,
+                   m.parent_tree_id,
+                   m.risk_status_id,
+                   m.extra_structure_id,
+                   m.knowledge_id,
+                   m.node_name,
+                   m.node_type,
+                   pt.node_deep + 1,
+                   COALESCE((SELECT MAX(t2.node_order) FROM tv_structure_tree t2
+                             WHERE t2.parent_id = m.parent_tree_id), 0)
+                       + ROW_NUMBER() OVER (PARTITION BY m.parent_tree_id ORDER BY m.risk_status_id),
+                   '1',
+                   'FMEA20260901', 'FMEA20260901', now(), now()
+            FROM missing m
+            JOIN tv_structure_tree pt ON pt.id = m.parent_tree_id;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        EXIT WHEN v_count = 0;
+    END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.8 重建措施节点(18/19)：父为所属措施状态(风险状态)的树节点，
+--     必须在 2.7 措施状态节点重建之后执行；
+--     risk_status_id 为空的措施（如优化类措施）无树节点父级，不插入并在校验中列出
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+BEGIN
+    LOOP
+        WITH missing AS (
+            SELECT ms.id           AS measure_id,
+                   ms.project_id   AS project_id,
+                   ms.node_type    AS node_type,
+                   ms.knowledge_id AS knowledge_id,
+                   -- 父级为优化状态(21)：描述+[期限=yyyy/MM/dd 责任人=名称 状态]，空值用?代替；
+                   -- 其他状态：预防措施拼[O=分]、探测措施拼[D=分]（有分才拼）
+                   CASE
+                       WHEN (SELECT rs.node_type FROM tt_risk_status rs WHERE rs.id = ms.risk_status_id) = 21
+                           THEN ms.description || ' [期限=' ||
+                                CASE WHEN ms.opt_plan_date IS NULL OR trim(ms.opt_plan_date) = '' THEN '?'
+                                     ELSE to_char(ms.opt_plan_date::timestamp, 'YYYY/MM/DD') END
+                                || ' 责任人=' || COALESCE(NULLIF(trim(ms.opt_resp_name), ''), '?')
+                                || ' ' || CASE ms.measure_status
+                                              WHEN '1' THEN '计划中'
+                                              WHEN '2' THEN '取消'
+                                              WHEN '3' THEN '已完成'
+                                              ELSE '?'
+                                          END || ']'
+                       ELSE ms.description || CASE
+                              WHEN ms.score_number IS NOT NULL AND ms.node_type = 18 THEN '[O=' || ms.score_number::text || ']'
+                              WHEN ms.score_number IS NOT NULL AND ms.node_type = 19 THEN '[D=' || ms.score_number::text || ']'
+                              ELSE '' END
+                   END AS node_name,
+                   pt.id           AS parent_tree_id,
+                   pt.extra_structure_id AS extra_structure_id
+            FROM tmp_restore_measure ms
+            JOIN tv_structure_tree pt
+                 ON pt.project_id = ms.project_id
+                AND pt.extra_id = ms.risk_status_id
+                AND pt.node_type = (SELECT rs.node_type FROM tt_risk_status rs
+                                    WHERE rs.id = ms.risk_status_id AND rs.project_id = ms.project_id AND rs.del_flag = '0')
+            WHERE ms.risk_status_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM tv_structure_tree t
+                WHERE t.project_id = ms.project_id
+                  AND t.extra_id = ms.id
+                  AND t.node_type = ms.node_type
+            )
+        )
+        INSERT INTO tv_structure_tree
+                (project_id, parent_id, extra_id, extra_structure_id, knowledge_id,
+                 node_name, node_type, node_deep, node_order, has_child,
+                 remote_id, category,
+                 create_by, update_by, update_time, create_time)
+            SELECT m.project_id,
+                   m.parent_tree_id,
+                   m.measure_id,
+                   m.extra_structure_id,
+                   m.knowledge_id,
+                   m.remote_id,
+                   m.category,
+                   m.node_name,
+                   m.node_type,
+                   pt.node_deep + 1,
+                   COALESCE((SELECT MAX(t2.node_order) FROM tv_structure_tree t2
+                             WHERE t2.parent_id = m.parent_tree_id), 0)
+                       + ROW_NUMBER() OVER (PARTITION BY m.parent_tree_id ORDER BY m.measure_id),
+                   '1',
+                   'FMEA20260901', 'FMEA20260901', now(), now()
+            FROM missing m
+            JOIN tv_structure_tree pt ON pt.id = m.parent_tree_id;
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        EXIT WHEN v_count = 0;
+    END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.9 回填 node_path：node_path = 父级node_path + 自身id + '/'
+--     例：父级 node_path = /1/2/3/4/，子级 node_path = /1/2/3/4/子级id/
+--     （CTE 内 INSERT 与主 UPDATE 同快照互相看不到，必须用独立语句逐层回填）
+-- ---------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+BEGIN
+    LOOP
+        UPDATE tv_structure_tree t
+        SET node_path = pt.node_path || t.id || '/'
+        FROM tv_structure_tree pt
+        WHERE t.parent_id = pt.id
+          AND pt.node_path IS NOT NULL AND pt.node_path <> ''
+          AND (t.node_path IS NULL OR t.node_path = '');
+
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+        EXIT WHEN v_count = 0;
+    END LOOP;
+END $$;
+
+-- 仍缺 node_path 的节点数（非0说明父链断裂或根节点本身无 node_path，需人工排查）
+SELECT COUNT(*) AS missing_node_path_count
+FROM tv_structure_tree
+WHERE node_path IS NULL OR node_path = '';
+
+-- ---------------------------------------------------------------------
+-- 2.10 修正 has_child：无子级的新节点置'0'，有新子级的父节点置'1'
+-- ---------------------------------------------------------------------
+UPDATE tv_structure_tree t
+SET has_child = '0'
+WHERE t.create_by = 'FMEA20260901'
+  AND NOT EXISTS (SELECT 1 FROM tv_structure_tree c WHERE c.parent_id = t.id);
+
+UPDATE tv_structure_tree t
+SET has_child = '1'
+WHERE t.has_child IS DISTINCT FROM '1'
+  AND EXISTS (SELECT 1 FROM tv_structure_tree c
+              WHERE c.parent_id = t.id AND c.create_by = '数据恢复');
+
+-- ---------------------------------------------------------------------
+-- 2.11 校验（确认后再 COMMIT）
+-- ---------------------------------------------------------------------
+-- 本次重建的树节点数量
+SELECT COUNT(*) AS rebuilt_tree_nodes FROM tv_structure_tree WHERE create_by = '数据恢复';
+
+-- 【父节点找不到而未挂接】的记录清单（正常应为 0 行；有数据说明其
+-- 上级节点异常，需人工核对，绝不允许出现孤儿树节点）
+SELECT 'structure' AS src, s.id, s.project_id, s.parent_id
+FROM tmp_restore_structure s
+WHERE NOT EXISTS (SELECT 1 FROM tv_structure_tree t
+                  WHERE t.project_id = s.project_id AND t.extra_id = s.id AND t.node_type = s.node_type)
+UNION ALL
+SELECT 'function', f.id, f.project_id, f.parent_id
+FROM tmp_restore_function f
+WHERE NOT EXISTS (SELECT 1 FROM tv_structure_tree t
+                  WHERE t.project_id = f.project_id AND t.extra_id = f.id AND t.node_type = f.node_type)
+UNION ALL
+SELECT 'failure', fl.id, fl.project_id, fl.function_id
+FROM tmp_restore_failure fl
+WHERE NOT EXISTS (SELECT 1 FROM tv_structure_tree t
+                  WHERE t.project_id = fl.project_id AND t.extra_id = fl.id AND t.node_type = fl.node_type)
+UNION ALL
+SELECT 'measure', ms.id, ms.project_id, ms.failure_id
+FROM tmp_restore_measure ms
+WHERE NOT EXISTS (SELECT 1 FROM tv_structure_tree t
+                  WHERE t.project_id = ms.project_id AND t.extra_id = ms.id AND t.node_type = ms.node_type)
+UNION ALL
+SELECT 'risk_status', rs.id, rs.project_id, rs.failure_id
+FROM tmp_restore_risk_status rs
+WHERE NOT EXISTS (SELECT 1 FROM tv_structure_tree t
+                  WHERE t.project_id = rs.project_id AND t.extra_id = rs.id AND t.node_type = rs.node_type);
+
+-- 子树范围内不应再存在“业务行存活但树节点缺失”的情况（正常 0 行）
+SELECT 'tree_dirty' AS src, t.id, t.extra_id, t.node_type
+FROM tv_structure_tree t
+WHERE t.extra_structure_id IN (SELECT id FROM tmp_restore_structure)
+  AND t.parent_id IS NOT NULL
+  AND t.parent_id <> 0
+  AND NOT EXISTS (SELECT 1 FROM tv_structure_tree p WHERE p.id = t.parent_id);
+
+-- 逻辑删除标记恢复确认（正常全部为 0）
+SELECT 'tt_structure' AS tbl, COUNT(*) FROM tt_structure   WHERE id IN (SELECT id FROM tmp_restore_structure)   AND del_flag <> '0'
+UNION ALL
+SELECT 'tt_function',  COUNT(*) FROM tt_function    WHERE id IN (SELECT id FROM tmp_restore_function)    AND del_flag <> '0'
+UNION ALL
+SELECT 'tt_failure',   COUNT(*) FROM tt_failure     WHERE id IN (SELECT id FROM tmp_restore_failure)     AND del_flag <> '0'
+UNION ALL
+SELECT 'tt_measure',   COUNT(*) FROM tt_measure     WHERE id IN (SELECT id FROM tmp_restore_measure)     AND del_flag <> '0'
+UNION ALL
+SELECT 'tt_risk_status', COUNT(*) FROM tt_risk_status WHERE id IN (SELECT id FROM tmp_restore_risk_status) AND del_flag <> '0';
+
+-- 校验无误后提交；有问题把下行改为 ROLLBACK;
+COMMIT;
