@@ -1,0 +1,160 @@
+const fs = require('fs');
+const path = require('path');
+
+// ---- gear geometry (bigger) ----
+const cy = 8;
+const rTip = 4.05;
+const rRoot = 3.15;
+const rHub = 1.6;
+const cxL = 4.2;   // left gear center
+const cxR = 11.8;  // right gear center
+const teeth = 8;
+
+function n(v) { return String(Number(v.toFixed(2))); }
+
+function outline(cx) {
+  const step = 2 * Math.PI / teeth;
+  const fr = [0, 0.22, 0.44, 0.66];
+  const rr = [rRoot, rTip, rTip, rRoot];
+  let d = '';
+  for (let i = 0; i < teeth; i++) {
+    for (let j = 0; j < 4; j++) {
+      const a = i * step + fr[j] * step;
+      const r = rr[j];
+      const x = cx + r * Math.cos(a);
+      const y = cy + r * Math.sin(a);
+      d += (i === 0 && j === 0 ? 'M' : 'L') + n(x) + ',' + n(y);
+    }
+  }
+  return d + 'Z';
+}
+
+// counter-clockwise hole (sweep-flag 0) => hollow under nonzero rule
+function hole(cx) {
+  const x1 = cx + rHub, x2 = cx - rHub;
+  return 'M' + n(x1) + ',' + n(cy) +
+    'A' + n(rHub) + ',' + n(rHub) + ' 0 1 0 ' + n(x2) + ',' + n(cy) +
+    'A' + n(rHub) + ',' + n(rHub) + ' 0 1 0 ' + n(x1) + ',' + n(cy) + 'Z';
+}
+
+const outL = outline(cxL), outR = outline(cxR);
+const holeL = hole(cxL), holeR = hole(cxR);
+
+// REVERSED semantics: SOLID = connected, HOLLOW(open hole) = unconnected
+// none(0) neither connected -> both hollow
+// left(1) left connected     -> left solid, right hollow
+// right(2) right connected   -> left hollow, right solid
+// full(3) both connected     -> both solid
+const variants = {
+  noneIcon: outL + holeL + outR + holeR,
+  leftIcon: outL + outR + holeR,
+  rightIcon: outL + holeL + outR,
+  fullIcon: outL + outR
+};
+
+// ---- apply to fmea.js blocks 12 (功能) and 13 (特性) ----
+const file = path.join(__dirname, '..', 'src', 'store', 'modules', 'fmea.js');
+let src = fs.readFileSync(file, 'utf8');
+const lines = src.split('\n');
+
+function replaceBlock(keyLine) {
+  // find the object key line, e.g. "      12: {"
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === keyLine) { start = i; break; }
+  }
+  if (start < 0) throw new Error('block not found: ' + keyLine);
+  for (let i = start; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t === '},') break; // end of block
+    for (const key of Object.keys(variants)) {
+      if (t.startsWith(key + ':')) {
+        const eol = lines[i].endsWith('\r') ? '\r' : '';
+        const indent = lines[i].match(/^\s*/)[0].replace(/\r$/, '');
+        lines[i] = indent + key + ": '" + variants[key] + "'," + eol;
+      }
+    }
+  }
+}
+
+replaceBlock('12: {');
+replaceBlock('13: {');
+
+fs.writeFileSync(file, lines.join('\n'), 'utf8');
+console.log('applied. lengths:',
+  Object.keys(variants).map(k => k + '=' + variants[k].length).join(' '));
+
+// ---- winding-number verification (nonzero fill rule) ----
+function parsePath(d) {
+  const cmds = d.match(/[MLA][^MLA]*/g) || [];
+  const pts = [];
+  let cur = null;
+  for (const c of cmds) {
+    const type = c[0];
+    const nums = (c.slice(1).match(/-?\d*\.?\d+/g) || []).map(Number);
+    if (type === 'M') { cur = [nums[0], nums[1]]; pts.push(cur.slice()); }
+    else if (type === 'L') { cur = [nums[0], nums[1]]; pts.push(cur.slice()); }
+    else if (type === 'A') {
+      const rx = nums[0], ry = nums[1], x2 = nums[5], y2 = nums[6];
+      const sweep = nums[4];
+      // approximate arc by sampling
+      const cx0 = (cur[0] + x2) / 2, cy0 = (cur[1] + y2) / 2;
+      let a0 = Math.atan2(cur[1] - cy0, cur[0] - cx0);
+      let a1 = Math.atan2(y2 - cy0, x2 - cx0);
+      if (sweep === 0) { while (a1 > a0) a1 -= 2 * Math.PI; }
+      else { while (a1 < a0) a1 += 2 * Math.PI; }
+      const N = 24;
+      for (let s = 1; s <= N; s++) {
+        const a = a0 + (a1 - a0) * s / N;
+        cur = [cx0 + rx * Math.cos(a), cy0 + ry * Math.sin(a)];
+        pts.push(cur.slice());
+      }
+    }
+  }
+  return pts;
+}
+
+function winding(pts, px, py) {
+  let w = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i];
+    const [x2, y2] = pts[(i + 1) % pts.length];
+    if (y1 <= py) {
+      if (y2 > py && (x2 - x1) * (py - y1) - (px - x1) * (y2 - y1) > 0) w++;
+    } else {
+      if (y2 <= py && (x2 - x1) * (py - y1) - (px - x1) * (y2 - y1) < 0) w--;
+    }
+  }
+  return w;
+}
+
+// split a path string into subpaths for per-subpath analysis is unnecessary;
+// nonzero uses all subpaths together.
+console.log('\n--- winding check (nonzero: 0=hollow, !=0=solid) ---');
+for (const [name, d] of Object.entries(variants)) {
+  const pts = parsePath(d);
+  const wL = winding(pts, cxL, cy);
+  const wR = winding(pts, cxR, cy);
+  const wTooth = winding(pts, cxL + (rHub + rRoot) / 2, cy);
+  console.log(name.padEnd(9),
+    'leftHub=' + wL, '(' + (wL === 0 ? 'hollow' : 'solid') + ')',
+    'rightHub=' + wR, '(' + (wR === 0 ? 'hollow' : 'solid') + ')',
+    'ringBody=' + wTooth);
+}
+
+// ---- preview svg ----
+const scale = 8, pad = 20, cellW = 16 * scale + pad * 2;
+let svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + (cellW * 4) + '" height="' + (16 * scale + pad * 2 + 30) + '">\n';
+svg += '<rect width="100%" height="100%" fill="#ffffff"/>\n';
+const labels = { noneIcon: 'none(0) 未连接', leftIcon: 'left(1) 左连接', rightIcon: 'right(2) 右连接', fullIcon: 'full(3) 已连接' };
+let idx = 0;
+for (const [name, d] of Object.entries(variants)) {
+  const ox = idx * cellW + pad;
+  const color = '#228B22';
+  svg += '<g transform="translate(' + ox + ',' + pad + ') scale(' + scale + ')"><path d="' + d + '" fill="' + color + '"/></g>\n';
+  svg += '<text x="' + (ox + 16 * scale / 2) + '" y="' + (16 * scale + pad + 20) + '" font-size="14" text-anchor="middle" fill="#333">' + labels[name] + '</text>\n';
+  idx++;
+}
+svg += '</svg>\n';
+fs.writeFileSync(path.join(__dirname, 'gear-preview.svg'), svg, 'utf8');
+console.log('\npreview written: build/gear-preview.svg');
